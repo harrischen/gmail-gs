@@ -79,7 +79,7 @@ const CONFIG = {
         'from:substack.com OR from:medium.com OR from:dev.to OR from:infoq.com)',
       label: 'Auto - 技术阅读',
       markRead: false,
-      archive: false,
+      archive: true,
     },
     {
       name: '账单 / 订单 / 收据',
@@ -110,7 +110,7 @@ const CONFIG = {
       query: 'is:unread (from:npmjs.com OR subject:"npm")',
       label: 'npm',
       markRead: false,
-      archive: false,
+      archive: true,
     },
     // 按「你会拿它做什么」分组, 不按「谁发的」分组 —— 建一个 google 标签会把
     // 账号安全告警和扩展更新混在一起, 而两者处理方式完全不同
@@ -129,7 +129,7 @@ const CONFIG = {
       query: 'is:unread (from:dribbble.com OR from:iconscout.com)',
       label: 'Auto - 设计',
       markRead: false,
-      archive: false,
+      archive: true,
     },
     {
       name: '服务通知',
@@ -139,28 +139,28 @@ const CONFIG = {
         'from:chromewebstore-noreply@google.com)',
       label: 'Auto - 服务通知',
       markRead: false,
-      archive: false,
+      archive: true,
     },
     {
       name: '营销推广',
       query: 'is:unread category:promotions',
       label: 'Auto - 营销推广',
       markRead: false,
-      archive: false,
+      archive: true,
     },
     {
       name: '社交通知',
       query: 'is:unread category:social',
       label: 'Auto - 社交通知',
       markRead: false,
-      archive: false,
+      archive: true,
     },
     {
       name: '系统更新通知',
       query: 'is:unread category:updates',
       label: 'Auto - 系统通知',
       markRead: false,
-      archive: false,
+      archive: true,
     },
     {
       // ===== 兜底 =====
