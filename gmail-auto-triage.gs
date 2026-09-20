@@ -1,59 +1,49 @@
 /**
  * Gmail 自动分诊脚本
  *
- * 用法:
- *   1. 打开 https://script.google.com → 新建项目
- *   2. 把本文件全部内容粘进去，保存
- *   3. 第一次务必保持 CONFIG.dryRun = true，运行 preview() 看统计
- *   4. 确认无误后把 dryRun 改成 false，运行 run()
- *   5. 想长期自动跑，运行 installDailyTrigger()
- *   6. 后悔了就跑 undoByLabel('Auto/营销推广')
+ * 编辑器下拉框里只有 4 个:
+ *   run()                 按 CONFIG.rules 批量分类(只打标签)
+ *   deleteAllLabels()     删除全部标签
+ *   clearAllLabels()      清空全部标签的邮件(标签保留)
+ *   installDailyTrigger() 每天定时跑 run()
  *
- * 安全设计:
- *   - 只归档(archive), 永不删除。归档 = 移出收件箱, 邮件仍在「所有邮件」里可搜索
- *   - 星标邮件永不处理
- *   - 默认只处理「已读」以外的未读邮件, 处理完标记已读, 因此重复运行不会重复处理
+ * 单个标签的操作在 tools 里, 不占下拉框:
+ *   tools.deleteLabel()   删除单个标签   ← 标签名填 CONFIG.targetLabel
+ *   tools.clearLabel()    清空单个标签的邮件(标签保留)  ← 同上
+ * 用法: 在文件末尾加一行 tools.deleteLabel() 运行, 用完删掉。
+ *
+ * 上手: run() 分类 → installDailyTrigger() 之后每天自动跑。
+ *       存量多时 run() 一次跑不完, 多跑几次即可(它有 4.5 分钟时间预算)。
+ *
+ * 编辑器点「运行」不能传参, 操作单个标签只能填 CONFIG.targetLabel。
+ *
+ * ⚠️ 删除/清空不可逆, 没有备份, 也没有撤销功能:
+ *    执行前会打印清单(标签名/封数/是否手工分类), 但打完就执行, 没有二次确认。
+ *    手工分类(工作邮件/勤城达)是手动归类的, 清掉后没有任何规则能还原。
+ *
+ * 依赖: 需启用 Gmail API 高级服务(编辑器左侧「服务」→ 添加服务 → Gmail API)。
  */
-
 const CONFIG = {
-  // ===== 第一次一定保持 true, 只统计不动作 =====
-  dryRun: true,
+  // 没有演练开关: 所有函数都是真执行。删除/清空会先打印清单, 但打完就执行。
+  maxMessagesPerRule: 1000,    // 每条规则单次最多处理多少封消息
+  maxMessagesPerLabel: 5000,   // 每个标签单次最多处理多少封(清空用, 一次只对付一个标签)
+  timeBudgetMs: 4.5 * 60 * 1000, // 到点就停, 剩下的下次继续(单次执行硬上限 6 分钟)
 
-  // 单次最多处理多少封线程 (Apps Script 单次执行上限 6 分钟, 保守设小一点)
-  maxThreadsPerRun: 150,
+  // 操作单个标签时读这个 —— 编辑器点运行不能传参, 只能这样指定
+  targetLabel: '',
 
-  // 时间预算: 到点就停, 剩下的下次继续。6 分钟硬上限, 这里留 1.5 分钟余量
-  timeBudgetMs: 4.5 * 60 * 1000,
+  protectQuery: '-is:starred',   // 星标邮件永不处理
 
-  // 永不处理的邮件 (星标保护)
-  protectQuery: '-is:starred',
+  // 这些标签下的邮件会被分类规则【跳过】(规则会自动加 -label:xxx)。
+  // 留空 = 所有邮件都参与分类, 包括手工分类的那些。
+  // 想保护手工分类不被叠加 Auto - xxx 标签, 就填回去, 例如 ['工作邮件', '勤城达']。
+  protectedLabels: [],
 
-  // ===== 已有标签保护 =====
-  // 这些标签下的邮件, 任何规则都不会碰(不会打新标签/标已读/归档)。
-  // 已经在这些标签下的邮件 = 你已经手动分好类了, 脚本不该再动。
-  // 注意: 新邮件没有这些标签, 所以仍会被下面的规则正常归类进去。
-  // 注意: 工作邮件 / 勤城达 是你手动归类的, 发件人五花八门, 没有任何 from: 规则能复现。
-  //      所以它们【只保护, 不清理, 不重新分配】——resetAll 绝不能碰, 否则你的手工分类就永久丢了。
-  protectedLabels: ['工作邮件', '招商银行', '勤城达'],
+  // 「删除全部/清空全部」要跳过的标签。默认空 = 全纳入
+  excludeFromBulk: [],
 
-  // ===== 纳入管理的已有标签 =====
-  // resetAll() 会清空这些标签; run() 会按规则把邮件重新分配进去。
-  // 加进来的标签必须同时在下面的 rules 里有对应的归类规则, 否则清空后没人认领,
-  // 会被兜底规则(历史遗留未读)吃掉并归档。
-  // 只有「发件人明确、规则能自动复现」的标签才能进这里。
-  // 工作邮件 / 勤城达 不在这里 —— 它们是手工分类, 清空了就再也回不来。
-  // 注: Google Analytics / Chrome Web Store 保留在这里, 是为了让 resetAll 把它们清空,
-  //     这样里面的旧邮件能被重新分配到 Auto/服务通知。
-  //     等 resetAll 跑完、这两个标签空了之后, 就可以从本列表移除, 并在 Gmail 设置里删掉标签
-  //     (和 Notes 一样: 齿轮 → 查看所有设置 → Labels → Remove)。
-  managedLabels: ['招商银行', 'npm', 'Google Analytics', 'Chrome Web Store'],
-
-  // ===== 分类规则 =====
-  // 按顺序执行, 命中即处理。越具体的规则放前面, 兜底规则放最后。
-  // 可用搜索语法:
-  //   category:promotions / updates / social / forums / purchases  (Gmail 自带分类)
-  //   older_than:7d / newer_than:1y
-  //   from:xxx  subject:"xxx"  has:attachment  label:xxx
+  // 按顺序执行, 命中即处理。越具体的放前面, 兜底放最后。
+  // 语法: category:xxx / older_than:7d / from:xxx / subject:"xxx" / label:xxx
   rules: [
     {
       name: '验证码 / 登录确认',
@@ -62,8 +52,8 @@ const CONFIG = {
         'is:unread (subject:"验证码" OR subject:"校验码" OR subject:"动态码" OR subject:"确认码" OR ' +
         'subject:"身份验证" OR subject:"登录确认" OR subject:"verification code" OR subject:"security code" OR ' +
         'subject:"one-time" OR subject:"OTP" OR subject:"passcode" OR subject:"2FA")',
-      label: 'Auto/验证码',
-      markRead: true,
+      label: 'Auto - 验证码',
+      markRead: false,
       archive: false,
     },
     // 放在「验证码」之后: 验证码是一次性的码(7天后自动归档),
@@ -79,39 +69,31 @@ const CONFIG = {
         'subject:"密码已修改" OR subject:"密码重置" OR subject:"账号异常" OR subject:"账户异常" OR ' +
         'subject:"security alert" OR subject:"new sign-in" OR subject:"unusual activity" OR ' +
         'subject:"password changed" OR subject:"sign-in attempt" OR subject:"verify your identity")',
-      label: 'Auto/账号安全',
+      label: 'Auto - 账号安全',
       markRead: false,
       archive: false,
     },
     {
       name: '技术博客 / Newsletter',
-      // ⚠️ Gmail 的 from: 是【子串匹配】不是精确域名匹配!
-      //    from:newsletter 会命中 nikeofficial@newsletter.nike.com.cn 这种广告邮件
-      //    所以: (1) 只填完整域名, 别填 newsletter/digest/weekly/blog 这种通用词
-      //         (2) 保留 -category:promotions 作为兜底, 营销邮件永远不进这个标签
-      //    把你真实订阅的技术源填进下面的 from: 列表
+      // ⚠️ from: 是子串匹配: from:newsletter 会命中 nikeofficial@newsletter.nike.com.cn
+      //    所以只填完整域名, 别填 newsletter/weekly/blog 这类通用词
       query:
         'is:unread -category:promotions (from:indiehackers.com OR from:leadershipintech.com OR ' +
         'from:substack.com OR from:medium.com OR from:dev.to OR from:infoq.com)',
-      label: 'Auto/技术阅读',
-      markRead: true,
-      archive: true, // 跳过收件箱, 想看的时候去标签里看
+      label: 'Auto - 技术阅读',
+      markRead: false,
+      archive: false,
     },
     {
       name: '账单 / 订单 / 收据',
       query: 'is:unread (category:purchases OR category:reservations)',
-      label: 'Auto/账单',
+      label: 'Auto - 账单',
       markRead: false, // 账单建议保留未读提醒, 你可能真要看
       archive: false,
     },
-    // ===== 你已有的标签 =====
-    // ⚠️ 下面每条的 from: 都要按你的真实发件人核对。不确定就运行 listTopSenders() 看真实域名。
-    //    archive:false 表示只打标签不归档 —— 重要的用 false, 噪音类的用 true
-    // 工作邮件 / 勤城达 不在这里 —— 手工分类无法用 from: 规则复现,
-    // 它们只出现在 CONFIG.protectedLabels 里(任何规则都不碰)。
-    // 招商银行: 实测发件域名是 message.cmbchina.com, 标题多为「电子账单」「XX优惠」
-    // 策略: 不靠关键字赌哪些重要, 而是【全部先留收件箱, 再用「7天过期归档」兜住总量】
-    //       这样就算关键字漏判, 也不会误归档 —— 最坏情况只是它在收件箱多躺 7 天
+    // 招商银行: 发件域 message.cmbchina.com。策略是不赌哪些标题重要,
+    //   全部先留收件箱, 再用下面「7天过期归档」兜住总量 —— 漏判也不会误归档
+    // 工作邮件 / 勤城达 没有对应规则 —— 手工分类无法用 from: 复现
     {
       name: '招商银行 - 营销',
       // 只把明显是营销的挑出来立刻归档
@@ -119,8 +101,8 @@ const CONFIG = {
         'is:unread from:message.cmbchina.com (subject:"优惠" OR subject:"活动" OR subject:"分期" OR ' +
         'subject:"积分" OR subject:"尊享" OR subject:"推荐" OR subject:"红包" OR subject:"抽奖" OR subject:"券")',
       label: '招商银行',
-      markRead: true,
-      archive: true,
+      markRead: false,
+      archive: false,
     },
     {
       name: '招商银行 - 其余(含电子账单)',
@@ -136,37 +118,39 @@ const CONFIG = {
       //       还款提醒过期就没用了; 而且所有邮件都在「招商银行」标签里, 随时能翻。
       query: 'label:招商银行 in:inbox older_than:7d',
       label: '招商银行',
-      markRead: true,
-      archive: true,
+      markRead: false,
+      archive: false,
+      // ⚠️ 必须 bypass: 如果 protectedLabels 里填了「招商银行」, buildQuery() 会自动加
+      //    -label:招商银行, 而这条规则的查询本身就是 label:招商银行 —— 自相矛盾, 永远命中 0 条。
+      //    现在 protectedLabels 是空的, 它暂时不生效; 但填回去时没有它会出问题。
+      bypassProtect: true,
     },
     // Notes 标签已空, 建议在 Gmail 设置里直接删掉, 这里不建规则
     {
       name: 'npm',
       query: 'is:unread (from:npmjs.com OR subject:"npm")',
       label: 'npm',
-      markRead: true,
-      archive: true, // 版本更新通知, 归档即可
+      markRead: false,
+      archive: false,
     },
-    // Google Analytics / Chrome Web Store 不发独立标签了, 统一进「服务通知」。
-    // 理由: 按【你会拿它做什么】分组, 而不是按【谁发的】分组。
-    //       建一个 "google" 标签会把账号安全告警和扩展更新通知混在一起, 而这两者处理方式完全不同。
-    // ===== 从 listTopSenders() 数据里发现的新聚类 =====
-    // 注意: from: 是子串匹配, 所以 from:openai.com 能同时命中 email.openai.com / tm.openai.com
+    // 按「你会拿它做什么」分组, 不按「谁发的」分组 —— 建一个 google 标签会把
+    // 账号安全告警和扩展更新混在一起, 而两者处理方式完全不同
+    // from: 子串匹配, from:openai.com 能同时命中 email. / tm.openai.com
     {
       name: 'AI 服务',
       query:
         'is:unread (from:openai.com OR from:anthropic.com OR from:poe.com OR ' +
         'from:x.ai OR from:okara.ai)',
-      label: 'Auto/AI服务',
-      markRead: true,
-      archive: true, // 订阅/用量通知, 不需要实时看
+      label: 'Auto - AI服务',
+      markRead: false,
+      archive: false,
     },
     {
       name: '设计',
       query: 'is:unread (from:dribbble.com OR from:iconscout.com)',
-      label: 'Auto/设计',
-      markRead: true,
-      archive: true,
+      label: 'Auto - 设计',
+      markRead: false,
+      archive: false,
     },
     {
       name: '服务通知',
@@ -175,64 +159,483 @@ const CONFIG = {
         'is:unread (from:cloudflare.com OR from:clerk.com OR from:stripe.com OR ' +
         'from:huggingface.co OR from:analytics-noreply@google.com OR ' +
         'from:chromewebstore-noreply@google.com)',
-      label: 'Auto/服务通知',
-      markRead: true,
-      archive: true,
+      label: 'Auto - 服务通知',
+      markRead: false,
+      archive: false,
     },
     {
       name: '营销推广 (Gmail 已识别的)',
       query: 'is:unread category:promotions older_than:3d',
-      label: 'Auto/营销推广',
-      markRead: true,
-      archive: true,
+      label: 'Auto - 营销推广',
+      markRead: false,
+      archive: false,
     },
     {
       name: '社交通知',
       query: 'is:unread category:social older_than:3d',
-      label: 'Auto/社交通知',
-      markRead: true,
-      archive: true,
+      label: 'Auto - 社交通知',
+      markRead: false,
+      archive: false,
     },
     {
       name: '系统更新通知',
       query: 'is:unread category:updates older_than:3d',
-      label: 'Auto/系统通知',
-      markRead: true,
-      archive: true,
+      label: 'Auto - 系统通知',
+      markRead: false,
+      archive: false,
     },
     {
       name: '验证码归档 (7天前)',
-      query: 'is:read label:Auto/验证码 older_than:7d',
-      label: 'Auto/验证码',
-      markRead: true,
-      archive: true,
+      // ⚠️ 必须加引号: 标签名带空格, 不加会被 Gmail 按空格拆成多个条件
+      query: 'is:read label:"Auto - 验证码" older_than:7d',
+      label: 'Auto - 验证码',
+      markRead: false,
+      archive: false,
     },
     {
       // ===== 兜底: 清理历史包袱 =====
       // 30 天前的未读邮件, 如果到今天都没看, 大概率以后也不会看
       name: '历史遗留未读 (30天前)',
       query: 'is:unread older_than:30d',
-      label: 'Auto/待清理',
-      markRead: true,
-      archive: true,
+      label: 'Auto - 待清理',
+      markRead: false,
+      archive: false,
     },
   ],
 };
 
-/** 主入口: 按规则处理 */
-function run() {
-  console.log('===== Gmail 自动分诊 =====');
-  console.log(`模式: ${CONFIG.dryRun ? 'DRY RUN (只看不做)' : '实际执行'}`);
-  console.log('');
+/**
+ * 内部函数都挂这里, 调用写 tools.xxx()。
+ * Apps Script 下拉框会列出所有顶层函数(function 和 const 都算),
+ * 挂到对象上就不会出现。
+ */
+// Gmail 的系统标签。batchModify 里直接用这些 ID, 不需要也不能去创建
+const SYSTEM_LABEL_IDS = [
+  'INBOX', 'UNREAD', 'STARRED', 'SENT', 'DRAFT',
+  'SPAM', 'TRASH', 'IMPORTANT', 'CHAT',
+];
 
-  if (CONFIG.dryRun) {
-    collectStats().forEach((s) => {
-      console.log(`${s.name}: 命中 ${s.count} 封  → ${s.actions}`);
+let _labelIdMap = null;
+
+/**
+ * 内部实现全部收在这个对象里, 调用写 tools.xxx()。
+ * Apps Script 下拉框会列出所有顶层函数(function 和 const 都算),
+ * 挂在对象上就不会出现。
+ */
+const tools = {
+
+  /**
+   * 需求 1 & 2 的共用实现: 删除标签本身。
+   * 不需要遍历邮件 —— Gmail 删除标签会自动把它从所有邮件上移除, 是 O(标签数)。
+   */
+  /**
+     * 删除单个标签(标签名填 CONFIG.targetLabel)。
+     * 邮件一封都不会删 —— Gmail 删标签会自动把它从所有邮件上移除。
+     * ⚠️ 不可逆, 执行前只打印清单, 没有二次确认。
+     */
+  deleteLabel(name) {
+    const label = tools.resolveTarget(name);
+    if (!label) return;
+    tools.bulkDeleteLabels([label]);
+  },
+
+  bulkDeleteLabels(labels) {
+    if (labels.length === 0) {
+      console.log('没有用户标签可删。');
+      return;
+    }
+    tools.previewLabels(labels, '删除');
+
+    let n = 0;
+    labels.forEach((l) => {
+      try {
+        if (tools.deleteLabelObject(l)) n++;
+      } catch (e) {
+        console.log(`  删除「${l.name}」失败: ${e.message}`);
+      }
+    });
+    tools.resetLabelCache();
+    console.log(`共删除 ${n} 个标签。邮件本身不受影响。`);
+  },
+
+  /**
+   * 删掉一个标签对象, 直接用 id。
+   * ⚠️ 方法名是 remove 不是 delete —— Apps Script 把 delete(JS 保留字)改名成 remove。
+   */
+  /**
+   * 演练: 只看不动, 打印每条规则会命中多少封。
+   * 不在 6 个需求里, 所以挂在 tools 上, 不占下拉框。
+   */
+
+  deleteLabelObject(label) {
+    Gmail.Users.Labels.remove('me', label.id);
+    console.log(`已删除: ${label.name}`);
+    return true;
+  },
+
+  /** 把某个标签下的邮件放回收件箱、标回未读, 并移除该标签 */
+
+  /**
+   * 全部重来: 清空所有用户标签, 把涉及到的邮件
+   *   1. 移除标签
+   *   2. 标回未读   ← 关键: 规则都是匹配 is:unread, 不标回未读下次就匹配不到了
+   *   3. 放回 inbox ← 关键: 归档过的也要放回来
+   * 恢复到跑脚本之前的状态, 然后重新运行 run() 即可重新分诊。
+   *
+   * 注意: 跑完后收件箱会瞬间回到 2000+ 未读, 这是预期的。
+   */
+
+  /**
+   * 清空一批标签下的邮件。需求 3/4 和撤销都走这里。
+   * 先把 messageId 全部快照下来再分块执行 —— 不能靠「重搜搜不到」判定结束,
+   * Gmail 索引更新不是同步的, 重搜会返回同一批导致重复处理。
+   */
+  /**
+     * 清空单个标签下的邮件(标签名填 CONFIG.targetLabel), 标签本身保留。
+     * ⚠️ 不可逆, 执行前只打印清单, 没有二次确认。
+     */
+  clearLabel(name) {
+    const label = tools.resolveTarget(name);
+    if (!label) return;
+    tools.bulkRemoveLabels([label], false, false);
+  },
+
+  bulkRemoveLabels(labels, restoreInbox, markUnread) {
+    if (labels.length === 0) {
+      console.log('没有用户标签。');
+      return;
+    }
+    tools.previewLabels(labels, '清空');
+
+    const add = [
+      restoreInbox ? 'INBOX' : null,
+      markUnread ? 'UNREAD' : null,
+    ].filter(Boolean).map(tools.resolveLabelId);
+
+    const startedAt = Date.now();
+    const outOfTime = () => Date.now() - startedAt > CONFIG.timeBudgetMs;
+
+    let total = 0;
+    let stopped = false;
+    const pending = [];
+
+    for (let i = 0; i < labels.length; i++) {
+      const label = labels[i];
+      if (outOfTime()) {
+        stopped = true;
+        pending.push(label.name);
+        continue;
+      }
+
+      try {
+        const { ids, truncated } = tools.listMessageIds(
+          tools.labelQuery(label.name),
+          CONFIG.maxMessagesPerLabel,
+          outOfTime
+        );
+        if (ids.length === 0) {
+          console.log(`「${label.name}」: 0 封`);
+          continue;
+        }
+
+        const applied = tools.batchModifyAll(ids, add, [label.id], outOfTime);
+        total += applied;
+
+        const partial = applied < ids.length;
+        if (partial || truncated) pending.push(label.name);
+        console.log(`「${label.name}」: ${applied} 封${partial ? ' (本次未做完)' : ''}`);
+      } catch (e) {
+        console.log(`「${label.name}」处理失败: ${e.message}`);
+        pending.push(label.name);
+      }
+    }
+
+    console.log('');
+    console.log(`共处理 ${total} 封消息。`);
+    if (stopped) console.log('⏱ 接近执行时限, 已提前停止。');
+    if (pending.length) {
+      // 绝不说「已清空」—— 没跑完就是没跑完
+      console.log(`以下标签可能还有剩余, 再运行一次本函数继续: ${pending.join(', ')}`);
+    } else {
+      console.log('本轮范围内已全部处理完。');
+    }
+  },
+
+  /**
+   * 存量清理期专用: 每 10 分钟跑一次。
+   * ⚠️ 免费账号触发器 90 分钟/天配额, 一天约 20 次。清完换回 installDailyTrigger()。
+   */
+
+  /** 只读诊断: 列出每个标签的 名字/id/类型/邮件数, 用来分清系统标签和自建标签 */
+
+  /**
+   * 诊断工具: 列出未读邮件里出现最多的发件人域名, 方便你填规则里的 from:。
+   * 运行后看「执行日志」, 按出现次数从多到少排列。
+   */
+
+  /**
+   * 拉取符合条件的 messageId, 翻页到耗尽或达到 cap。
+   *
+   * 这是整个脚本唯一的数据源 —— 统计和执行都走它, 口径统一为【消息数】。
+   * 返回 truncated 表示「还有更多没拉完」, 调用方据此提示用户再跑一次。
+   */
+  listMessageIds(query, cap, shouldStop) {
+    tools.ensureGmailApi();
+    cap = cap || CONFIG.maxMessagesPerRule;
+
+    const ids = [];
+    let pageToken = null;
+    let truncated = false;
+
+    while (ids.length < cap) {
+      if (shouldStop && shouldStop()) {
+        truncated = true;
+        break;
+      }
+      const params = { q: query, maxResults: Math.min(500, cap - ids.length) };
+      // 只有非首页才带 pageToken —— 传 null 会被当成字面量参数
+      if (pageToken) params.pageToken = pageToken;
+
+      const res = Gmail.Users.Messages.list('me', params);
+      const page = res.messages || [];
+      page.forEach((m) => ids.push(m.id));
+
+      if (page.length === 0 || !res.nextPageToken) break;
+      pageToken = res.nextPageToken;
+      if (ids.length >= cap && res.nextPageToken) truncated = true;
+    }
+
+    return { ids: ids, truncated: truncated };
+  },
+
+  /**
+   * 唯一的执行原语: 按 1000 封切片调用 batchModify。
+   * 返回实际改了多少封(可能因时间预算少于 ids.length)。
+   */
+  batchModifyAll(ids, addLabelIds, removeLabelIds, shouldStop) {
+    const add = addLabelIds || [];
+    const remove = removeLabelIds || [];
+    if (add.length === 0 && remove.length === 0) return 0;
+
+    let applied = 0;
+    for (let k = 0; k < ids.length; k += 1000) {
+      if (shouldStop && shouldStop()) break;
+      const slice = ids.slice(k, k + 1000);
+      if (slice.length === 0) continue;
+      Gmail.Users.Messages.batchModify({
+        ids: slice,
+        addLabelIds: add,
+        removeLabelIds: remove,
+      }, 'me');
+      applied += slice.length;
+    }
+    return applied;
+  },
+
+  /**
+   * 编排一次批量操作: 搜索 → 执行 → 打日志。
+   * plan: { name, query, cap, addLabels:[名称或系统ID], removeLabels:[同上] }
+   */
+  runPlan(plan, shouldStop) {
+    const t0 = Date.now();
+    const { ids, truncated } = tools.listMessageIds(plan.query, plan.cap, shouldStop);
+    const t1 = Date.now();
+
+    if (ids.length === 0) {
+      console.log(`${plan.name}: 0 封 (搜索 ${tools.ms(t1 - t0)})`);
+      return { count: 0, truncated: false, stopped: !!(shouldStop && shouldStop()) };
+    }
+
+    const add = (plan.addLabels || []).map(tools.resolveLabelId);
+    const remove = (plan.removeLabels || []).map(tools.resolveLabelId);
+    const applied = tools.batchModifyAll(ids, add, remove, shouldStop);
+    const t2 = Date.now();
+
+    console.log(
+      `${plan.name}: ${applied} 封 (搜索 ${tools.ms(t1 - t0)} / 执行 ${tools.ms(t2 - t1)})`
+    );
+    return {
+      count: applied,
+      truncated: truncated || applied < ids.length,
+      stopped: !!(shouldStop && shouldStop()),
+    };
+  },
+
+  /** 标签增删后必须调这个, 否则缓存是脏的 */
+  resetLabelCache() {
+    _labelIdMap = null;
+  },
+
+  /** 把「标签名」或「系统标签 ID」解析成 batchModify 认的 labelId */
+  resolveLabelId(token) {
+    if (SYSTEM_LABEL_IDS.indexOf(token) >= 0) return token;
+    return tools.labelId(token);
+  },
+
+  /**
+   * 拼标签搜索条件。标签名带空格(如 "Auto - 验证码"), 必须加引号,
+   * 否则 Gmail 按空格拆成多个条件, 搜出来的完全不是你要的。
+   */
+  labelQuery(name) {
+    return `label:"${name}"`;
+  },
+
+  /** 重新拉一次「标签名 → labelId」映射 */
+  refreshLabelCache() {
+    _labelIdMap = {};
+    Gmail.Users.Labels.list('me').labels.forEach((l) => {
+      _labelIdMap[l.name] = l.id;
+    });
+    return _labelIdMap;
+  },
+
+  /** 标签名 → labelId。不存在就创建(走 GmailApp.createLabel, 建完重新拉缓存拿 ID) */
+  labelId(name) {
+    if (!_labelIdMap) tools.refreshLabelCache();
+    if (_labelIdMap[name]) return _labelIdMap[name];
+
+    // 标签名里的 " - " 不是嵌套分隔符(嵌套是 "/"), 所以不会产生父标签。
+    GmailApp.createLabel(name);
+    tools.refreshLabelCache();
+
+    if (!_labelIdMap[name]) throw new Error(`标签创建后仍拿不到 ID: ${name}`);
+    return _labelIdMap[name];
+  },
+
+  /**
+   * 所有用户标签 —— 需求 2/4 里「全部」的范围。
+   * ⚠️ 只能按 id/type 排除系统标签, 不能按显示名: 用户可能自建一个叫
+   *    "Sent Messages" 的标签(id 是 Label_xxx), 和真系统标签 SENT 是两回事。
+   */
+  allUserLabels() {
+    tools.ensureGmailApi();
+    const exclude = CONFIG.excludeFromBulk || [];
+    return Gmail.Users.Labels.list('me').labels
+      .filter((l) => l.type !== 'system')
+      .filter((l) => SYSTEM_LABEL_IDS.indexOf(l.id) < 0)
+      .filter((l) => l.id.indexOf('CATEGORY_') !== 0)
+      .filter((l) => exclude.indexOf(l.name) < 0);
+  },
+
+  findUserLabel(name) {
+    return tools.allUserLabels().filter((l) => l.name === name)[0] || null;
+  },
+
+  /** 解析单个标签操作的目标, 回落到 CONFIG.targetLabel。找不到返回 null */
+  resolveTarget(name) {
+    const labelName = name || CONFIG.targetLabel;
+    if (!labelName) {
+      console.log('请指定标签: 把标签名填进 CONFIG.targetLabel, 再运行本函数。');
+      console.log('(即 targetLabel: "工作邮件" 这样。编辑器点运行无法传参, 只能这样指定。)');
+      return null;
+    }
+    const label = tools.findUserLabel(labelName);
+    if (!label) {
+      console.log(`标签不存在, 或它是系统标签: ${labelName}`);
+      return null;
+    }
+    return label;
+  },
+
+  /**
+   * 危险操作的清单。总是先打印, 但打印完紧接着就执行 ——
+   * 它是「事后告诉你改了什么」, 不是「事前让你确认」。
+   */
+  previewLabels(labels, verb) {
+    const rows = labels.map(tools.describeLabel);
+    const totalMsgs = rows.reduce((a, r) => a + r.total, 0);
+
+    console.log(`演练: 将${verb} ${labels.length} 个标签, 涉及约 ${totalMsgs} 封消息:`);
+    rows.forEach((r) => {
+      console.log(`  ${r.name.padEnd(28)}${String(r.total).padStart(7)} 封   ${r.kind}`);
     });
     console.log('');
-    console.log('这是演练。确认无误后把 CONFIG.dryRun 改成 false 再运行 run()。');
-    return;
+
+    if (rows.some((r) => r.kind === '手工分类')) {
+      console.log('⚠️  清单里含【手工分类】标签。这些是手动归类的, 发件人五花八门,');
+      console.log('    没有任何 from: 规则能复现 —— 清掉后无法还原。');
+      console.log('    邮件还在「所有邮件」里, 但分类永久丢失。');
+      console.log('');
+    }
+  },
+
+  /**
+   * 标签的清单信息。邮件数优先用 Labels.get 的 messagesTotal(精确值),
+   * 拿不到就退回 Messages.list 的 resultSizeEstimate(估算值)。
+   * ⚠️ 不能静默吞异常 —— 吞了就会显示 0 封却查不出原因。
+   */
+  describeLabel(label) {
+    let total = 0;
+    let note = '';
+    try {
+      total = Gmail.Users.Labels.get('me', label.id).messagesTotal || 0;
+    } catch (e) {
+      note = ` (Labels.get 失败: ${e.message})`;
+      try {
+        const res = Gmail.Users.Messages.list('me', {
+          q: tools.labelQuery(label.name),
+          maxResults: 1,
+        });
+        total = res.resultSizeEstimate || 0;
+        note = ' (估算值)';
+      } catch (e2) {
+        note = ` (邮件数获取失败: ${e2.message})`;
+        total = 0;
+      }
+    }
+    if (note) console.log(`  ⚠️ 取「${label.name}」的邮件数${note}`);
+    return {
+      name: label.name,
+      id: label.id,
+      total: total,
+      kind: CONFIG.protectedLabels.indexOf(label.name) >= 0 ? '手工分类' : '脚本自建',
+    };
+  },
+
+  /** 抽样几封邮件的主题和发件人, 让人能判断「这个标签装的到底是不是我想清的东西」 */
+
+  buildQuery(base) {
+    const exclusions = [
+      CONFIG.protectQuery,
+      ...CONFIG.protectedLabels.map((l) => `-label:${l}`),
+    ].join(' ');
+    return `${base} ${exclusions}`;
+  },
+
+  /**
+   * 取某条规则的最终查询串。
+   * 默认会套上 tools.buildQuery() 加排除条件; 标了 bypassProtect 的规则不套 ——
+   * 用于「目标标签本身就在 protectedLabels 里」的场景(如招商银行过期归档),
+   * 否则会出现 label:X 和 -label:X 同时存在的矛盾查询, 永远命中 0 条。
+   */
+  queryFor(rule) {
+    return rule.bypassProtect ? rule.query : tools.buildQuery(rule.query);
+  },
+
+  ensureGmailApi() {
+    if (typeof Gmail === 'undefined') {
+      throw new Error(
+        '未启用 Gmail API 高级服务。请在 Apps Script 编辑器左侧「服务」→ 添加服务 → ' +
+        'Gmail API → 添加, 然后再运行。'
+      );
+    }
+  },
+
+  /** GmailApp.search 单次最多 500 条, 这里分页取够 max 条 */
+
+  /** 毫秒转可读字符串 */
+  ms(n) {
+    return `${(n / 1000).toFixed(1)}s`;
   }
+
+};
+
+// ===== 需求 5: 主入口, 按规则批量分类 =====
+
+function run() {
+  console.log('===== Gmail 自动分诊 =====');
+
+  tools.ensureGmailApi();
 
   // 实际执行: 带着时间预算跑, 超时就停, 剩下的交给下一次(触发器的下一次运行)
   const startedAt = Date.now();
@@ -246,268 +649,72 @@ function run() {
       stopped = true;
       break;
     }
-
     const rule = CONFIG.rules[i];
-    const threads = searchThreads(buildQuery(rule.query), CONFIG.maxThreadsPerRun, outOfTime);
-    if (threads.length === 0) continue;
+    const tag = `[${i + 1}/${CONFIG.rules.length}] ${rule.name}`;
+    try {
+      const r = tools.runPlan({
+        name: tag,
+        query: tools.queryFor(rule),
+        cap: CONFIG.maxMessagesPerRule,
+        addLabels: [rule.label],
+        removeLabels: [
+          rule.markRead ? 'UNREAD' : null,
+          rule.archive ? 'INBOX' : null,
+        ].filter(Boolean),
+      }, outOfTime);
 
-    const label = getOrCreateLabel(rule.label);
-    eachBatch(threads, (batch) => {
-      label.addToThreads(batch);
-      if (rule.markRead) GmailApp.markThreadsRead(batch);
-      if (rule.archive) GmailApp.moveThreadsToArchive(batch);
-    }, outOfTime);
-
-    total += threads.length;
-    console.log(`[${i + 1}/${CONFIG.rules.length}] ${rule.name}: 处理 ${threads.length} 封`);
+      total += r.count;
+      if (r.stopped) {
+        stopped = true;
+        break;
+      }
+    } catch (e) {
+      // 一条规则挂了(比如查询语法写错)不能拖垮剩下 15 条
+      console.log(`${tag}: 出错已跳过 — ${e.message}`);
+    }
   }
 
   console.log('');
-  console.log(`本次共处理 ${total} 封。剩余未读: ${GmailApp.getInboxUnreadCount()}`);
+  console.log(`本次共处理 ${total} 封消息。剩余未读: ${GmailApp.getInboxUnreadCount()}`);
   if (stopped) {
     console.log('⏱ 接近单次执行时限, 已提前停止。未处理完的会在下次运行继续。');
   }
-  console.log('后悔了就运行 undoByLabel("标签名") 把它们放回收件箱。');
-}
 
-/** 只看不动: 打印每条规则会命中多少封 */
-function preview() {
-  const saved = CONFIG.dryRun;
-  CONFIG.dryRun = true;
-  run();
-  CONFIG.dryRun = saved;
-}
-
-/** 把某个标签下的邮件全部放回收件箱并标回未读 */
-function undoByLabel(labelName) {
-  const label = GmailApp.getUserLabelByName(labelName);
-  if (!label) {
-    console.log(`标签不存在: ${labelName}`);
-    return;
-  }
-  const threads = searchThreads(`label:${labelName}`, CONFIG.maxThreadsPerRun);
-  eachBatch(threads, (batch) => {
-    GmailApp.moveThreadsToInbox(batch);
-    GmailApp.markThreadsUnread(batch);
-  });
-  console.log(`已把 ${threads.length} 封放回收件箱并标为未读。`);
 }
 
 /**
- * 补救: 把误归入某个标签的营销邮件挪走。
- * 默认修 Auto/技术阅读 → Auto/营销推广 这次的误伤。
- *
- * 用法: 函数下拉框选 fixMislabeled → 运行。
- * 误伤超过 150 封就多跑几次(跑完的会被移出标签, 重跑不会重复)。
+ * 删除单个标签。邮件一封都不会删 —— Gmail 删标签会自动把它从所有邮件上移除,
+ * 所以不需要「先 clearLabel 再 deleteLabel」。
+ * ⚠️ 标签与邮件的关联永久丢失, 执行前只打印清单, 没有二次确认。
  */
-function fixMislabeled(fromLabelName, toLabelName) {
-  fromLabelName = fromLabelName || 'Auto/技术阅读';
-  toLabelName = toLabelName || 'Auto/营销推广';
 
-  const startedAt = Date.now();
-  const outOfTime = () => Date.now() - startedAt > CONFIG.timeBudgetMs;
-
-  const threads = searchThreads(
-    `label:${fromLabelName} category:promotions`,
-    CONFIG.maxThreadsPerRun,
-    outOfTime
-  );
-
-  if (threads.length === 0) {
-    console.log(`「${fromLabelName}」里没有营销邮件, 无需处理。`);
-    return;
-  }
-
-  const fromLabel = GmailApp.getUserLabelByName(fromLabelName);
-  const toLabel = getOrCreateLabel(toLabelName);
-
-  eachBatch(threads, (batch) => {
-    fromLabel.removeFromThreads(batch);
-    toLabel.addToThreads(batch);
-    GmailApp.moveThreadsToArchive(batch);
-  }, outOfTime);
-
-  console.log(`已把 ${threads.length} 封从「${fromLabelName}」移到「${toLabelName}」并归档。`);
-  console.log('如果还有剩余, 再运行一次本函数。');
+/**
+ * 删除全部用户标签(含手工分类的)。
+ * 系统标签(INBOX / SENT / SPAM 等)不在范围内, 它们本来也删不掉。
+ */
+function deleteAllLabels() {
+  tools.bulkDeleteLabels(tools.allUserLabels());
 }
 
 /**
- * 诊断工具: 列出未读邮件里出现最多的发件人域名, 方便你填规则里的 from:。
- * 运行后看「执行日志」, 按出现次数从多到少排列。
+ * 清空单个标签下的邮件, 标签本身保留。
+ * 只移除标签, 不动收件箱位置、不动已读状态。
  */
-function listTopSenders(query, byFullAddress) {
-  query = query || 'is:unread';
-
-  const threads = searchThreads(query, 300);
-  const counter = {};
-
-  threads.forEach((t) => {
-    const raw = t.getMessages()[0].getFrom(); // 形如 "Name <a@b.com>"
-    const match = raw.match(/<(.+?)>/);
-    const addr = (match ? match[1] : raw).trim();
-    const domain = addr.split('@')[1] || addr;
-    const key = byFullAddress ? addr : domain;
-    counter[key] = (counter[key] || 0) + 1;
-  });
-
-  console.log(`查询 [${query}] 共采样 ${threads.length} 封, 按${byFullAddress ? '完整地址' : '域名'}统计:`);
-  Object.entries(counter)
-    .sort((a, b) => b[1] - a[1])
-    .forEach(([key, n]) => console.log(`  ${n}\t${key}`));
-  console.log('(采样上限 300 封; 要看更细用 listTopSenders("查询", true))');
-}
 
 /**
- * 移除某个标签下的所有邮件上的该标签(不归档、不改已读状态)。
- * 用于"这个标签全部分错了, 清空它, 让下次 run() 重新分诊"。
+ * 清空全部用户标签下的邮件, 标签本身保留。
  */
-function clearLabel(labelName) {
-  labelName = labelName || 'Auto/技术阅读';
-  const label = GmailApp.getUserLabelByName(labelName);
-  if (!label) {
-    console.log(`标签不存在: ${labelName}`);
-    return;
-  }
-  const startedAt = Date.now();
-  const outOfTime = () => Date.now() - startedAt > CONFIG.timeBudgetMs;
-
-  const threads = searchThreads(`label:${labelName}`, CONFIG.maxThreadsPerRun, outOfTime);
-  eachBatch(threads, (batch) => label.removeFromThreads(batch), outOfTime);
-  console.log(`已清空「${labelName}」标签下的 ${threads.length} 封。下次 run() 会重新分诊。`);
+function clearAllLabels() {
+  tools.bulkRemoveLabels(tools.allUserLabels(), false, false);
 }
 
-/**
- * 全部重来: 清空所有 Auto/ 开头的标签, 把涉及到的邮件
- *   1. 移除标签
- *   2. 标回未读   ← 关键: 规则都是匹配 is:unread, 不标回未读下次就匹配不到了
- *   3. 放回 inbox ← 关键: 归档过的也要放回来
- * 恢复到跑脚本之前的状态, 然后重新运行 run() 即可重新分诊。
- *
- * 注意: 跑完后收件箱会瞬间回到 2000+ 未读, 这是预期的。
- *       处理量超过单次时限就多跑几次, 每跑完 100 封标签就被移除, 进度会保留。
- */
-function resetAll() {
-  const startedAt = Date.now();
-  const outOfTime = () => Date.now() - startedAt > CONFIG.timeBudgetMs;
+// ===== 需求 6: 定时 =====
 
-  // Auto/ 系列 + CONFIG.managedLabels 里你已有的标签, 全部清空
-  const autoLabels = GmailApp.getUserLabels().filter((l) => l.getName().indexOf('Auto') === 0);
-  const managed = CONFIG.managedLabels
-    .map((n) => GmailApp.getUserLabelByName(n))
-    .filter(Boolean);
-
-  const seen = new Set();
-  const labels = autoLabels.concat(managed).filter((l) => {
-    if (seen.has(l.getName())) return false;
-    seen.add(l.getName());
-    return true;
-  });
-
-  if (labels.length === 0) {
-    console.log('没有找到任何 Auto/ 或 managedLabels 标签, 无需重置。');
-    return;
-  }
-  console.log(`待清空的标签: ${labels.map((l) => l.getName()).join(', ')}`);
-
-  let total = 0;
-  let stopped = false;
-
-  for (const label of labels) {
-    if (outOfTime()) { stopped = true; break; }
-    const name = label.getName();
-
-    // 每轮取 300 封(内部再按 100 切块执行), 清空后再取下一轮
-    let restored = 0;
-    while (!outOfTime()) {
-      const threads = searchThreads(`label:${name}`, 300, outOfTime);
-      if (threads.length === 0) break;
-
-      eachBatch(threads, (batch) => {
-        label.removeFromThreads(batch);
-        GmailApp.moveThreadsToInbox(batch);
-        GmailApp.markThreadsUnread(batch);
-      }, outOfTime);
-
-      restored += threads.length;
-    }
-    total += restored;
-    console.log(`「${name}」已清空, 恢复 ${restored} 封`);
-  }
-
-  console.log('');
-  console.log(`本次共恢复 ${total} 封到未读 + 收件箱。`);
-  if (stopped) {
-    console.log('⏱ 接近执行时限, 已提前停止。再运行 resetAll() 继续。');
-  } else {
-    console.log('重置完成。现在运行 run() 重新分诊。');
-  }
-}
-
-/** 安装每日定时任务 (每天凌晨自动跑一次) */
+/** 安装每日定时任务 (每天凌晨按 appsscript.json 的 timeZone 跑一次) */
 function installDailyTrigger() {
   ScriptApp.getProjectTriggers()
     .filter((t) => t.getHandlerFunction() === 'run')
     .forEach((t) => ScriptApp.deleteTrigger(t));
   ScriptApp.newTrigger('run').timeBased().atHour(3).everyDays(1).create();
   console.log('已安装每日凌晨 3 点自动运行。');
-}
-
-function uninstallTriggers() {
-  ScriptApp.getProjectTriggers().forEach((t) => ScriptApp.deleteTrigger(t));
-  console.log('已移除所有定时任务。');
-}
-
-// ---------- 内部函数 ----------
-
-function buildQuery(base) {
-  const exclusions = [
-    CONFIG.protectQuery,
-    ...CONFIG.protectedLabels.map((l) => `-label:${l}`),
-  ].join(' ');
-  return `${base} ${exclusions}`;
-}
-
-function collectStats() {
-  return CONFIG.rules.map((rule) => ({
-    name: rule.name,
-    count: searchThreads(buildQuery(rule.query), CONFIG.maxThreadsPerRun).length,
-    actions: [
-      `标签「${rule.label}」`,
-      rule.markRead ? '标已读' : null,
-      rule.archive ? '归档' : null,
-    ]
-      .filter(Boolean)
-      .join(' + '),
-  }));
-}
-
-/** GmailApp.search 单次最多 500 条, 这里分页取够 max 条 */
-function searchThreads(query, max, shouldStop) {
-  const result = [];
-  const pageSize = 100;
-  let start = 0;
-  while (result.length < max) {
-    if (shouldStop && shouldStop()) break;
-    const batch = GmailApp.search(query, start, Math.min(pageSize, max - result.length));
-    if (batch.length === 0) break;
-    result.push(...batch);
-    start += batch.length;
-  }
-  return result;
-}
-
-function getOrCreateLabel(name) {
-  return GmailApp.getUserLabelByName(name) || GmailApp.createLabel(name);
-}
-
-/**
- * Gmail 的批量 API (addToThreads / markThreadsRead / moveThreadsToArchive 等)
- * 单次调用上限是 100 个线程, 超了会抛 "at most 100 threads", 所以这里切块执行。
- */
-function eachBatch(threads, fn, shouldStop) {
-  const BATCH_SIZE = 100;
-  for (let i = 0; i < threads.length; i += BATCH_SIZE) {
-    if (shouldStop && shouldStop()) return;
-    fn(threads.slice(i, i + BATCH_SIZE));
-  }
 }

@@ -1,12 +1,21 @@
 # Gmail 自动分诊脚本
 
-一个 Google Apps Script，用来把堆积的 Gmail 收件箱自动分类、归档。
+一个 Google Apps Script，用来给堆积的 Gmail 邮件自动打分类标签。
 
 初衷：收件箱堆了 2000+ 封未读邮件，绝大部分是营销推广，混着验证码、技术博客、
 银行账单和账号安全告警。手动清不现实，第三方工具要么收费、要么要交出邮箱权限。
 所以用 Apps Script 自己做——**数据不出你的 Google 账号，零成本，规则完全可控**。
 
+`run()` 只做一件事：**给命中的邮件打标签**。不动收件箱位置，不改已读状态。
+
 ---
+
+## 前置条件
+
+除了 Apps Script，还需要启用 **Gmail API 高级服务**：
+编辑器左侧「服务」→ 添加服务 → Gmail API → 添加。
+
+所有批量操作都走 `batchModify`（1 个请求改 1000 封）。没启用时会直接报错并提示怎么开，不会静默失败。
 
 ## 快速开始
 
@@ -14,8 +23,8 @@
 2. 把 `gmail-auto-triage.gs` 的全部内容粘进编辑器，保存
 3. 左侧**项目设置**（齿轮）→ 勾选「在编辑器中显示 appsscript.json 清单文件」
 4. 把本仓库 `appsscript.json` 的内容填进去（目的是收窄权限，见下文）
-5. 保持 `CONFIG.dryRun = true`，运行 `preview()`，看每条规则各命中多少封
-6. 核对数字合理后，把 `dryRun` 改成 `false`，运行 `run()`
+5. 左侧**服务** → 添加服务 → Gmail API
+6. 运行 `run()` 分类（存量多就多跑几次，它有 4.5 分钟时间预算）
 7. 想长期自动跑，运行 `installDailyTrigger()`
 
 **首次运行会弹授权。** 因为是自己写的脚本，Google 会提示「此应用未经过验证」，
@@ -25,14 +34,16 @@
 
 ## 设计原则
 
-### 1. 只归档，永不删除
+### 1. 只打标签，不删邮件
 
-脚本从头到尾没有一行删除代码。归档 = 移出收件箱，邮件仍然在「所有邮件」里可搜索。
-所有操作都可回滚。
+`run()` 从头到尾没有一行删除邮件代码。它唯一的动作是**给命中的邮件加分类标签**，
+不动收件箱位置、不改已读状态。所有邮件都还在「所有邮件」里。
 
-### 2. 不可逆的批量操作，默认先演练
+### 2. 加标签是安全的，删标签不可逆
 
-`dryRun: true` 时只统计不动作。批量归档 2000 封这种事，先看看会发生什么再执行。
+`run()` 只加标签，随时可以重跑、覆盖，没有风险。
+但 `deleteAllLabels` / `clearAllLabels` 会丢掉标签与邮件的关联，且**无法撤销**——
+脚本里没有备份，也没有撤销功能。
 
 ### 3. 按「你拿它做什么」分类，不按「谁发的」分类
 
@@ -42,59 +53,129 @@
 
 反面例子：建一个 `google` 标签。Google 域名下混着账号安全告警（必须看）和
 Chrome 扩展更新通知（噪音），处理方式完全不同，塞进一个标签就毁了。
-所以本项目把它们拆到 `Auto/账号安全`（不归档）和 `Auto/服务通知`（归档）。
+所以本项目把它们拆到 `Auto - 账号安全` 和 `Auto - 服务通知`。
 
 ### 4. 误判代价不对称时，宁可多留
 
-银行邮件、账号安全告警这类，漏看的代价远大于收件箱多几封。
-所以它们 `archive: false`，宁可占地方也不静默归档。
+银行邮件、账号安全告警这类，漏看的代价远大于多看几封。
+所以判定它们的规则写得更严格（限定发件域名 + 主题关键词），宁可漏判也不误判。
 
 ### 5. 靠时间衰减兜住总量，而不是靠猜关键字
 
 招商银行邮件量大，但不去赌哪些标题重要（猜错代价太高）。
-改为：全部先留收件箱，再用一条 `older_than:7d` 规则归档。
-这样收件箱里的招行邮件永远不超过 7 天的量，而且**关键字漏判也不会误归档**——
-最坏情况只是多躺 7 天。
+规则只做「认出发件域名是 cmbchina.com」，不做内容判断——**关键字漏判也不会误伤**，
+最坏情况只是某封招行邮件没被认出来。
 
 ---
 
 ## 函数一览
 
-| 函数 | 参数 | 作用 |
-|---|---|---|
-| `run()` | 无 | 主入口，按 `CONFIG.rules` 处理 |
-| `preview()` | 无 | 强制 dry run 跑一次，只看统计 |
-| `installDailyTrigger()` | 无 | 安装每日凌晨 3 点定时执行 |
-| `uninstallTriggers()` | 无 | 移除所有定时任务 |
-| `listTopSenders(query, byFullAddress)` | 可选 | 诊断：列出发件人域名分布，用来填规则的 `from:` |
-| `resetAll()` | 无 | **全部重来**：清空所有受管标签 + 放回 inbox + 标回未读 |
-| `clearLabel(name)` | 默认 `Auto/技术阅读` | 只移除某个标签，不动 inbox/已读状态 |
-| `undoByLabel(name)` | 需改默认值 | 把某标签下的邮件放回 inbox 并标回未读 |
-| `fixMislabeled(from, to)` | 有默认值 | 把某个标签里的营销邮件挪走 |
+### 下拉框里只有 4 个
 
-> **注意**：Apps Script 编辑器点「运行」时**无法给函数传参数**。
-> 需要参数的函数要么改代码里的默认值，要么在文件末尾临时加一行调用再删掉。
+| 函数 | 作用 |
+|---|---|
+| `run()` | 按 `CONFIG.rules` 批量分类（只打标签） |
+| `deleteAllLabels()` | 删除全部标签 |
+| `clearAllLabels()` | 清空全部标签的邮件（标签保留） |
+| `installDailyTrigger()` | 每天凌晨 3 点定时跑 `run()` |
+
+### 单个标签的操作（在 tools 里，不占下拉框）
+
+| 函数 | 作用 |
+|---|---|
+| `tools.deleteLabel()` | 删除单个标签 |
+| `tools.clearLabel()` | 清空单个标签的邮件（标签保留） |
+
+用法：把标签名填进 `CONFIG.targetLabel`，然后在**文件末尾加一行**调用，跑完删掉：
+
+```js
+tools.deleteLabel()
+```
+
+编辑器点「运行」不能传参，所以这是唯一的方式。
+
+### 为什么下拉框正好 4 个
+
+Apps Script 的下拉框会把**所有顶层函数**都列出来，
+不管写成 `function foo(){}` 还是 `const foo = function(){}` —— 两种都会出现。
+
+所以 22 个内部函数全部收在一个对象字面量里：
+
+```js
+const tools = {
+  listMessageIds(query, cap, shouldStop) { ... },
+  batchModifyAll(ids, add, remove, shouldStop) { ... },
+  // ...共 22 个, 都是支撑上面功能的, 不是独立功能
+};
+```
+
+它们不是顶层函数，下拉框里就不会出现。
+
+### 删除 vs 清空
+
+| 函数 | 移除标签 | 删除标签本身 |
+|---|---|---|
+| `clearLabel` / `clearAllLabels` | ✅ | ❌ |
+| `deleteLabel` / `deleteAllLabels` | — | ✅ |
+
+### 怎么指定操作哪个标签
+
+Apps Script 编辑器点「运行」**无法传参数**，`deleteLabel("标签名")` 这种写法
+在编辑器里做不到。唯一的方式是填 `CONFIG.targetLabel`：
+
+```js
+targetLabel: '工作邮件',   // 保存后运行 deleteLabel(), 就会删这个标签
+```
+
+留空就会提示你去填。
 
 ---
 
-## 两类标签的区别（最重要）
+## 没有开关，也没有演练
 
-这两个配置的作用完全不同，弄混了会丢数据：
+脚本里**没有任何需要你修改的开关**。选函数 → 点运行，直接生效。
+
+删除 / 清空标签在执行前会打印完整清单（标签名、各多少封、是否手工分类），
+但**打印完就执行了**——清单是告诉你改了什么，不是让你再确认一次。
+
+⚠️ **不可逆，没有备份，也没有撤销功能。**
+手工分类（工作邮件 / 勤城达）是手动归类的，发件人五花八门，
+没有任何 `from:` 规则能复现——清掉后邮件还在，但分类永久丢失。
+
+所以建议的顺序是：先用 `run()` 跑一遍看分类效果（它只加标签，风险低），
+确认满意了再去动标签。
+
+## 「全部」是哪个范围
+
+`deleteAllLabels()` / `clearAllLabels()` 里的「全部」=
+
+**所有 `type === 'user'` 的标签**，包含你手工分类的。
+
+用 Gmail API 返回的 `type` 字段判定，天然排除 INBOX / SENT / SPAM / DRAFT /
+CATEGORY_* 这些系统标签——它们本来也删不掉。不按名字前缀猜，所以不会出现
+「名字以 Auto 开头就误伤」的情况。
+
+想跳过某些标签，填 `CONFIG.excludeFromBulk`：
 
 ```js
-protectedLabels: ['工作邮件', '招商银行', '勤城达'],   // 只保护，任何规则都不碰
-managedLabels:   ['招商银行', 'npm', ...],            // resetAll 会清空它
+excludeFromBulk: ['工作邮件', '勤城达'],   // 批量操作永远跳过这两个
 ```
 
-**`protectedLabels`** —— 这些标签下的邮件，任何规则都不会打新标签/标已读/归档。
+## `protectedLabels` 只管分类，不管清空
 
-**`managedLabels`** —— `resetAll()` 会清空这些标签，让邮件重新分诊。
+```js
+protectedLabels: ['工作邮件', '招商银行', '勤城达'],
+```
 
-⚠️ **只有「发件人明确、规则能自动复现」的标签才能进 `managedLabels`。**
+它的作用是：**分类规则（`run()`）会跳过这些标签下的邮件**，不给它们打新标签。
+已经在这些标签下的邮件 = 你已经手动分好类了。
 
-`工作邮件` 和 `勤城达` 是手工分类的，发件人五花八门，**没有任何 `from:` 规则能复现**。
-它们如果进了 `managedLabels`，`resetAll` 一清，那些手工分类就**永久丢失**
-（邮件还在，但分类没了且无法还原）。所以它们只在 `protectedLabels` 里。
+⚠️ 它**不阻止** `clearAllLabels()` / `deleteAllLabels()`。
+「规则不碰」和「不允许清空」是两件事：前者是自动行为，后者是你显式调用的。
+清单里会把这些标签标成「手工分类」并警告，但不会替你拦下来。
+
+`招商银行` 在 `protectedLabels` 里，所以 `run()` 不会重复处理已归类的招行邮件；
+但它仍会被 `clearAllLabels()` 清空——需要保护就加进 `excludeFromBulk`。
 
 ---
 
@@ -109,11 +190,33 @@ from:newsletter   // 会命中 nikeofficial@newsletter.nike.com.cn ← Nike 广�
 所以**只填完整域名**，别填 `newsletter` / `digest` / `weekly` / `blog` 这种通用词。
 这条机制反过来也能用：`from:openai.com` 一次覆盖 `email.openai.com` 和 `tm.openai.com`。
 
-### 批量 API 单次上限 100 个线程
+### 批量操作必须用 batchModify，不能用 GmailApp
 
-`addToThreads` / `markThreadsRead` / `moveThreadsToArchive` 超过 100 会抛
-`Exception: This operation can only be applied to at most 100 threads`。
-所以有 `eachBatch()` 做切块。
+`GmailApp` 的 `addToThreads` / `markThreadsRead` / `moveThreadsToArchive`
+实测约 **0.4 秒/封**，且单次上限 100 个线程。8400 封要 56 分钟，跑不完。
+
+`Gmail.Users.Messages.batchModify` 是 **1 个请求改 1000 封**，8400 封只要 9 个请求。
+所以清空/删除全部走这条路径。
+
+代价：batchModify 操作的是**消息**不是线程。同一线程里的其它消息仍带原标签，
+所以清空后 `label:X` 可能仍命中——所以脚本按 ID 快照执行，并如实报告「还有剩余」。
+
+### 不能靠「重搜搜不到」判定结束
+
+Gmail 的搜索索引更新不是同步的。移除标签后**立刻**重搜，很可能又返回同一批。
+
+曾经用 `while` 循环反复搜 `label:X` 直到搜不到为止，
+结果是同一批邮件被反复处理、计数虚高、空转到超时。
+
+现在的做法：**先把要改的 messageId 全部快照下来，再分块执行**。
+结束条件是分页 `nextPageToken` 耗尽，不依赖重搜。
+
+### 统计和执行必须同口径
+
+统计曾经用 `GmailApp.search` 走**线程**数，而实际执行走 `batchModify`
+处理**消息**数。数字对不上，等于拿错误的基准判断「确认无误」。
+
+现在统计和执行都走同一个 `listMessageIds()`。
 
 ### Apps Script 单次执行上限 6 分钟
 
@@ -137,9 +240,9 @@ Google 是按 scope 授权，不是按你实际调用的方法。在 `appsscript
 **具体的在前，兜底在后。** 命中即处理，被前面的规则标为已读后，
 后面的规则就匹配不到了（规则都匹配 `is:unread`）。
 
-特别注意：`Auto/账号安全` 必须排在 `Auto/系统通知` 之前——
+特别注意：`Auto - 账号安全` 必须排在 `Auto - 系统通知` 之前——
 Google 的安全告警在 Gmail 里被判为 `category:updates`，
-排在后面会被系统通知规则抢走并归档。
+排在后面会被系统通知规则先匹配，打上错的标签。
 
 ---
 
@@ -168,46 +271,53 @@ has:attachment   label:xxx   in:inbox
 
 ## 内置分类
 
-| 标签 | 归档 | 说明 |
-|---|---|---|
-| `Auto/验证码` | 7 天后 | 一次性验证码，有时效性 |
-| `Auto/账号安全` | 否 | 异常登录、改密码、新设备 |
-| `Auto/技术阅读` | 是 | 技术博客 / Newsletter |
-| `Auto/账单` | 否 | Gmail 判定的购买/预订类 |
-| `招商银行` | 部分 | 营销的立刻归档，其余 7 天后归档 |
-| `npm` | 是 | 版本更新通知 |
-| `Auto/AI服务` | 是 | OpenAI / Anthropic / Poe 等 |
-| `Auto/设计` | 是 | Dribbble / IconScout |
-| `Auto/服务通知` | 是 | Cloudflare / Stripe / Clerk / GA / Chrome Web Store |
-| `Auto/营销推广` | 是 | Gmail 已识别的 promotions |
-| `Auto/社交通知` | 是 | Gmail 已识别的 social |
-| `Auto/系统通知` | 是 | Gmail 已识别的 updates |
-| `Auto/待清理` | 是 | 兜底：30 天前的未读 |
+`run()` 只给命中的邮件打标签，不动收件箱、不改已读状态。
+
+| 标签 | 说明 |
+|---|---|
+| `Auto - 验证码` | 一次性验证码，有时效性 |
+| `Auto - 账号安全` | 异常登录、改密码、新设备 |
+| `Auto - 技术阅读` | 技术博客 / Newsletter |
+| `Auto - 账单` | Gmail 判定的购买/预订类 |
+| `招商银行` | 招行邮件（含电子账单） |
+| `npm` | 版本更新通知 |
+| `Auto - AI服务` | OpenAI / Anthropic / Poe 等 |
+| `Auto - 设计` | Dribbble / IconScout |
+| `Auto - 服务通知` | Cloudflare / Stripe / Clerk / GA / Chrome Web Store |
+| `Auto - 营销推广` | Gmail 已识别的 promotions |
+| `Auto - 社交通知` | Gmail 已识别的 social |
+| `Auto - 系统通知` | Gmail 已识别的 updates |
+| `Auto - 待清理` | 兜底：30 天前的未读 |
+
+标签名用 ` - ` 而不是 `/`，所以不会产生嵌套父标签。带空格，搜索时必须加引号：
+`label:"Auto - 验证码"`。
 
 ---
 
 ## 执行顺序（别搞反）
 
 ```
-1. listTopSenders()              查真实发件域名
-2. 填好规则里的 from:             ← 没做完别往下走
-3. dryRun: true 跑 run()         核对命中数
-4. resetAll() 跑几次             清空旧标签
-5. dryRun: false 跑 run()        正式分诊，多跑几次
-6. installDailyTrigger()         之后每天自动增量处理
+1. 先在 Gmail 搜索框试几条规则, 确认能搜到该搜的邮件
+2. run()                          正式分诊, 存量多就多跑几次
+3. installDailyTrigger()          之后每天自动增量处理
+4. (可选, 且不可逆) clearAllLabels() / deleteAllLabels()
 ```
 
-**第 2 步没做完就跑第 4 步**，邮件清出来后没有规则认领，会掉进兜底规则被归档。
+**存量大的时候 `run()` 一次跑不完** —— 它有 4.5 分钟时间预算，
+到点会打印提示并停下，再跑一次继续即可。
+
+**第 1 步没做完就跑第 4 步**，邮件清出来后没有规则认领，清掉就真没了。
 
 ---
 
 ## 已知局限
 
-- **规则是白名单匹配**，做不到 100% 覆盖。漏判的邮件会掉进 `Auto/待清理`。
+- **规则是白名单匹配**，做不到 100% 覆盖。漏判的邮件会掉进 `Auto - 待清理`。
   要更高召回率就得把规则写宽，但会误伤——这是精确率和召回率的取舍，本脚本偏精确。
-- **无法还原手工分类**。所以手工标签必须放进 `protectedLabels`。
-- **收件箱未读数会先涨后降**。`resetAll()` 会把已归档的邮件标回未读，
-  这是重新分诊的必要步骤，不是出错。
+- **没有备份，也没有撤销**。手工分类（工作邮件 / 勤城达）清空或删除后无法还原。
+  唯一的防线是执行前打印的清单。要硬保护就填 `excludeFromBulk`。
+- **清空操作是幂等的**。重复执行不会出错（移除一个已经没有的标签是空操作），
+  所以「再运行一次继续」不会造成副作用。
 
 ---
 
@@ -224,5 +334,5 @@ has:attachment   label:xxx   in:inbox
 ]
 ```
 
-没法再降到 `gmail.readonly`——归档本身就是写操作。
+没法再降到 `gmail.readonly`——打标签本身就是写操作。
 改完后必须**重新授权一次**才会生效。
