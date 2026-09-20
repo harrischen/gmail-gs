@@ -42,12 +42,11 @@ const CONFIG = {
   // 「删除全部/清空全部」要跳过的标签。默认空 = 全纳入
   excludeFromBulk: [],
 
-  // 按顺序执行, 命中即处理。越具体的放前面, 兜底放最后。
-  // 语法: category:xxx / older_than:7d / from:xxx / subject:"xxx" / label:xxx
+  // 按顺序执行。越具体的放前面, 兜底放最后。
+  // 语法: category:xxx / from:xxx / subject:"xxx" / label:xxx
   rules: [
     {
       name: '验证码 / 登录确认',
-      // 验证码有时效性, 只打标签不立刻归档, 等 7 天后由下面的归档规则处理
       query:
         'is:unread (subject:"验证码" OR subject:"校验码" OR subject:"动态码" OR subject:"确认码" OR ' +
         'subject:"身份验证" OR subject:"登录确认" OR subject:"verification code" OR subject:"security code" OR ' +
@@ -56,12 +55,9 @@ const CONFIG = {
       markRead: false,
       archive: false,
     },
-    // 放在「验证码」之后: 验证码是一次性的码(7天后自动归档),
-    // 这里抓的是真正的安全事件(异常登录/改密码/新设备), 不归档、不标已读。
-    // 必须排在「系统通知」之前, 否则 Google 的安全告警会被 category:updates 吃掉归档。
+    // 必须排在「系统通知」之前, 否则 Google 的安全告警会被 category:updates 吃掉
     {
       name: '账号安全',
-      // 双重匹配: 既认发件域名, 也认主题关键字(覆盖没列进来的服务商)
       query:
         'is:unread (from:accounts.google.com OR from:appleid.apple.com OR from:id.apple.com OR ' +
         'from:account.meta.com OR from:accountprotection.microsoft.com OR ' +
@@ -88,15 +84,12 @@ const CONFIG = {
       name: '账单 / 订单 / 收据',
       query: 'is:unread (category:purchases OR category:reservations)',
       label: 'Auto - 账单',
-      markRead: false, // 账单建议保留未读提醒, 你可能真要看
+      markRead: false,
       archive: false,
     },
-    // 招商银行: 发件域 message.cmbchina.com。策略是不赌哪些标题重要,
-    //   全部先留收件箱, 再用下面「7天过期归档」兜住总量 —— 漏判也不会误归档
-    // 工作邮件 / 勤城达 没有对应规则 —— 手工分类无法用 from: 复现
+    // 招商银行: 发件域 message.cmbchina.com
     {
       name: '招商银行 - 营销',
-      // 只把明显是营销的挑出来立刻归档
       query:
         'is:unread from:message.cmbchina.com (subject:"优惠" OR subject:"活动" OR subject:"分期" OR ' +
         'subject:"积分" OR subject:"尊享" OR subject:"推荐" OR subject:"红包" OR subject:"抽奖" OR subject:"券")',
@@ -106,26 +99,11 @@ const CONFIG = {
     },
     {
       name: '招商银行 - 其余(含电子账单)',
-      // 电子账单里可能带还款金额/还款日, 不归档; 交给下面的 7 天规则兜底
       query: 'is:unread (from:message.cmbchina.com OR from:cmbchina.com)',
       label: '招商银行',
       markRead: false,
       archive: false,
     },
-    {
-      name: '招商银行 - 过期归档',
-      // 关键: 保证收件箱里的招行邮件永远不超过 7 天的量, 不管总数多少。
-      //       还款提醒过期就没用了; 而且所有邮件都在「招商银行」标签里, 随时能翻。
-      query: 'label:招商银行 in:inbox older_than:7d',
-      label: '招商银行',
-      markRead: false,
-      archive: false,
-      // ⚠️ 必须 bypass: 如果 protectedLabels 里填了「招商银行」, buildQuery() 会自动加
-      //    -label:招商银行, 而这条规则的查询本身就是 label:招商银行 —— 自相矛盾, 永远命中 0 条。
-      //    现在 protectedLabels 是空的, 它暂时不生效; 但填回去时没有它会出问题。
-      bypassProtect: true,
-    },
-    // Notes 标签已空, 建议在 Gmail 设置里直接删掉, 这里不建规则
     {
       name: 'npm',
       query: 'is:unread (from:npmjs.com OR subject:"npm")',
@@ -154,7 +132,6 @@ const CONFIG = {
     },
     {
       name: '服务通知',
-      // 低频系统通知: 都是标已读+归档, 不会分别去翻, 所以合并成一个标签
       query:
         'is:unread (from:cloudflare.com OR from:clerk.com OR from:stripe.com OR ' +
         'from:huggingface.co OR from:analytics-noreply@google.com OR ' +
@@ -164,39 +141,30 @@ const CONFIG = {
       archive: false,
     },
     {
-      name: '营销推广 (Gmail 已识别的)',
-      query: 'is:unread category:promotions older_than:3d',
+      name: '营销推广',
+      query: 'is:unread category:promotions',
       label: 'Auto - 营销推广',
       markRead: false,
       archive: false,
     },
     {
       name: '社交通知',
-      query: 'is:unread category:social older_than:3d',
+      query: 'is:unread category:social',
       label: 'Auto - 社交通知',
       markRead: false,
       archive: false,
     },
     {
       name: '系统更新通知',
-      query: 'is:unread category:updates older_than:3d',
+      query: 'is:unread category:updates',
       label: 'Auto - 系统通知',
       markRead: false,
       archive: false,
     },
     {
-      name: '验证码归档 (7天前)',
-      // ⚠️ 必须加引号: 标签名带空格, 不加会被 Gmail 按空格拆成多个条件
-      query: 'is:read label:"Auto - 验证码" older_than:7d',
-      label: 'Auto - 验证码',
-      markRead: false,
-      archive: false,
-    },
-    {
-      // ===== 兜底: 清理历史包袱 =====
-      // 30 天前的未读邮件, 如果到今天都没看, 大概率以后也不会看
-      name: '历史遗留未读 (30天前)',
-      query: 'is:unread older_than:30d',
+      // ===== 兜底 =====
+      name: '未分类',
+      query: 'is:unread',
       label: 'Auto - 待清理',
       markRead: false,
       archive: false,
@@ -204,11 +172,6 @@ const CONFIG = {
   ],
 };
 
-/**
- * 内部函数都挂这里, 调用写 tools.xxx()。
- * Apps Script 下拉框会列出所有顶层函数(function 和 const 都算),
- * 挂到对象上就不会出现。
- */
 // Gmail 的系统标签。batchModify 里直接用这些 ID, 不需要也不能去创建
 const SYSTEM_LABEL_IDS = [
   'INBOX', 'UNREAD', 'STARRED', 'SENT', 'DRAFT',
@@ -225,14 +188,10 @@ let _labelIdMap = null;
 const tools = {
 
   /**
-   * 需求 1 & 2 的共用实现: 删除标签本身。
-   * 不需要遍历邮件 —— Gmail 删除标签会自动把它从所有邮件上移除, 是 O(标签数)。
+   * 删除单个标签(标签名填 CONFIG.targetLabel)。
+   * 邮件一封都不会删 —— Gmail 删标签会自动把它从所有邮件上移除。
+   * ⚠️ 不可逆, 执行前只打印清单, 没有二次确认。
    */
-  /**
-     * 删除单个标签(标签名填 CONFIG.targetLabel)。
-     * 邮件一封都不会删 —— Gmail 删标签会自动把它从所有邮件上移除。
-     * ⚠️ 不可逆, 执行前只打印清单, 没有二次确认。
-     */
   deleteLabel(name) {
     const label = tools.resolveTarget(name);
     if (!label) return;
@@ -262,38 +221,16 @@ const tools = {
    * 删掉一个标签对象, 直接用 id。
    * ⚠️ 方法名是 remove 不是 delete —— Apps Script 把 delete(JS 保留字)改名成 remove。
    */
-  /**
-   * 演练: 只看不动, 打印每条规则会命中多少封。
-   * 不在 6 个需求里, 所以挂在 tools 上, 不占下拉框。
-   */
-
   deleteLabelObject(label) {
     Gmail.Users.Labels.remove('me', label.id);
     console.log(`已删除: ${label.name}`);
     return true;
   },
 
-  /** 把某个标签下的邮件放回收件箱、标回未读, 并移除该标签 */
-
   /**
-   * 全部重来: 清空所有用户标签, 把涉及到的邮件
-   *   1. 移除标签
-   *   2. 标回未读   ← 关键: 规则都是匹配 is:unread, 不标回未读下次就匹配不到了
-   *   3. 放回 inbox ← 关键: 归档过的也要放回来
-   * 恢复到跑脚本之前的状态, 然后重新运行 run() 即可重新分诊。
-   *
-   * 注意: 跑完后收件箱会瞬间回到 2000+ 未读, 这是预期的。
+   * 清空单个标签下的邮件(标签名填 CONFIG.targetLabel), 标签本身保留。
+   * ⚠️ 不可逆, 执行前只打印清单, 没有二次确认。
    */
-
-  /**
-   * 清空一批标签下的邮件。需求 3/4 和撤销都走这里。
-   * 先把 messageId 全部快照下来再分块执行 —— 不能靠「重搜搜不到」判定结束,
-   * Gmail 索引更新不是同步的, 重搜会返回同一批导致重复处理。
-   */
-  /**
-     * 清空单个标签下的邮件(标签名填 CONFIG.targetLabel), 标签本身保留。
-     * ⚠️ 不可逆, 执行前只打印清单, 没有二次确认。
-     */
   clearLabel(name) {
     const label = tools.resolveTarget(name);
     if (!label) return;
@@ -360,18 +297,6 @@ const tools = {
       console.log('本轮范围内已全部处理完。');
     }
   },
-
-  /**
-   * 存量清理期专用: 每 10 分钟跑一次。
-   * ⚠️ 免费账号触发器 90 分钟/天配额, 一天约 20 次。清完换回 installDailyTrigger()。
-   */
-
-  /** 只读诊断: 列出每个标签的 名字/id/类型/邮件数, 用来分清系统标签和自建标签 */
-
-  /**
-   * 诊断工具: 列出未读邮件里出现最多的发件人域名, 方便你填规则里的 from:。
-   * 运行后看「执行日志」, 按出现次数从多到少排列。
-   */
 
   /**
    * 拉取符合条件的 messageId, 翻页到耗尽或达到 cap。
@@ -592,24 +517,22 @@ const tools = {
     };
   },
 
-  /** 抽样几封邮件的主题和发件人, 让人能判断「这个标签装的到底是不是我想清的东西」 */
-
   buildQuery(base) {
     const exclusions = [
       CONFIG.protectQuery,
-      ...CONFIG.protectedLabels.map((l) => `-label:${l}`),
+      ...CONFIG.protectedLabels.map((l) => `-label:"${l}"`),
     ].join(' ');
     return `${base} ${exclusions}`;
   },
 
   /**
    * 取某条规则的最终查询串。
-   * 默认会套上 tools.buildQuery() 加排除条件; 标了 bypassProtect 的规则不套 ——
-   * 用于「目标标签本身就在 protectedLabels 里」的场景(如招商银行过期归档),
-   * 否则会出现 label:X 和 -label:X 同时存在的矛盾查询, 永远命中 0 条。
+   * 1. 套 buildQuery() 加排除条件(星标保护 + protectedLabels)。
+   * 2. 加 -label:"rule.label" 排除已打过标签的邮件, 让多次 run() 能推进进度,
+   *    而不是每次都卡在同一批 1000 封。
    */
   queryFor(rule) {
-    return rule.bypassProtect ? rule.query : tools.buildQuery(rule.query);
+    return tools.buildQuery(rule.query) + ` -label:"${rule.label}"`;
   },
 
   ensureGmailApi() {
@@ -620,8 +543,6 @@ const tools = {
       );
     }
   },
-
-  /** GmailApp.search 单次最多 500 条, 这里分页取够 max 条 */
 
   /** 毫秒转可读字符串 */
   ms(n) {
@@ -683,23 +604,12 @@ function run() {
 }
 
 /**
- * 删除单个标签。邮件一封都不会删 —— Gmail 删标签会自动把它从所有邮件上移除,
- * 所以不需要「先 clearLabel 再 deleteLabel」。
- * ⚠️ 标签与邮件的关联永久丢失, 执行前只打印清单, 没有二次确认。
- */
-
-/**
  * 删除全部用户标签(含手工分类的)。
  * 系统标签(INBOX / SENT / SPAM 等)不在范围内, 它们本来也删不掉。
  */
 function deleteAllLabels() {
   tools.bulkDeleteLabels(tools.allUserLabels());
 }
-
-/**
- * 清空单个标签下的邮件, 标签本身保留。
- * 只移除标签, 不动收件箱位置、不动已读状态。
- */
 
 /**
  * 清空全部用户标签下的邮件, 标签本身保留。
