@@ -25,7 +25,7 @@
  */
 const CONFIG = {
   // 没有演练开关: 所有函数都是真执行。删除/清空会先打印清单, 但打完就执行。
-  maxMessagesPerRule: 1000,    // 每条规则单次最多处理多少封消息
+  maxMessagesPerRule: Infinity, // 不限数量, 由 timeBudgetMs 控制上限
   maxMessagesPerLabel: 5000,   // 每个标签单次最多处理多少封(清空用, 一次只对付一个标签)
   timeBudgetMs: 4.5 * 60 * 1000, // 到点就停, 剩下的下次继续(单次执行硬上限 6 分钟)
 
@@ -42,7 +42,8 @@ const CONFIG = {
   // 「删除全部/清空全部」要跳过的标签。默认空 = 全纳入
   excludeFromBulk: [],
 
-  // 按顺序执行。越具体的放前面, 兜底放最后。
+  // 按顺序执行, 先命中的优先 —— 一封邮件只会拿到第一个命中规则的标签,
+  // 后面规则跳过它。越具体的放前面, 兜底放最后。
   // 语法: category:xxx / from:xxx / subject:"xxx" / label:xxx
   rules: [
     {
@@ -360,11 +361,19 @@ const tools = {
   /**
    * 编排一次批量操作: 搜索 → 执行 → 打日志。
    * plan: { name, query, cap, addLabels:[名称或系统ID], removeLabels:[同上] }
+   * processed: 本次 run() 已处理过的 messageId 集合(可选), 里面有的直接跳过。
    */
-  runPlan(plan, shouldStop) {
+  runPlan(plan, shouldStop, processed) {
     const t0 = Date.now();
-    const { ids, truncated } = tools.listMessageIds(plan.query, plan.cap, shouldStop);
+    const listed = tools.listMessageIds(plan.query, plan.cap, shouldStop);
     const t1 = Date.now();
+
+    // 同一次 run() 里前面规则已处理过的跳过, 让「兜底」规则真正只兜底:
+    // 不能靠查询里的 -label:xxx 排除 —— 兜底规则只排除自己的标签, 不排除其它规则的,
+    // 而且 Gmail 索引有延迟, 刚打上的标签下一次查询可能还查不出来。
+    const ids = processed
+      ? listed.ids.filter((id) => !processed.has(id))
+      : listed.ids;
 
     if (ids.length === 0) {
       console.log(`${plan.name}: 0 封 (搜索 ${tools.ms(t1 - t0)})`);
@@ -375,13 +384,15 @@ const tools = {
     const remove = (plan.removeLabels || []).map(tools.resolveLabelId);
     const applied = tools.batchModifyAll(ids, add, remove, shouldStop);
     const t2 = Date.now();
+    // 只记真正改过的, 时间预算中断时未执行的留给下次
+    if (processed) ids.slice(0, applied).forEach((id) => processed.add(id));
 
     console.log(
       `${plan.name}: ${applied} 封 (搜索 ${tools.ms(t1 - t0)} / 执行 ${tools.ms(t2 - t1)})`
     );
     return {
       count: applied,
-      truncated: truncated || applied < ids.length,
+      truncated: listed.truncated || applied < ids.length,
       stopped: !!(shouldStop && shouldStop()),
     };
   },
@@ -527,12 +538,17 @@ const tools = {
 
   /**
    * 取某条规则的最终查询串。
-   * 1. 套 buildQuery() 加排除条件(星标保护 + protectedLabels)。
-   * 2. 加 -label:"rule.label" 排除已打过标签的邮件, 让多次 run() 能推进进度,
-   *    而不是每次都卡在同一批 1000 封。
+   * 1. buildQuery(): 星标保护 + protectedLabels。
+   * 2. 排除【所有】规则的标签: 邮件只要已经带了任意一个分类标签, 就说明它被分类过了,
+   *    任何规则都不该再碰它 —— 规则按顺序执行, 先命中的优先。
+   *    ⚠️ 只排除"本规则自己的标签"是不够的: 兜底规则查询是 is:unread, 匹配全部未读,
+   *       它只排除自己的标签就等于把所有已分类邮件再捞一遍打个第二标签。
    */
   queryFor(rule) {
-    return tools.buildQuery(rule.query) + ` -label:"${rule.label}"`;
+    const classified = [...new Set(CONFIG.rules.map((r) => r.label))]
+      .map((l) => `-label:"${l}"`)
+      .join(' ');
+    return `${tools.buildQuery(rule.query)} ${classified}`;
   },
 
   ensureGmailApi() {
@@ -564,6 +580,9 @@ function run() {
 
   let total = 0;
   let stopped = false;
+  // 本次 run() 已处理过的 messageId。规则按顺序执行, 先命中的优先,
+  // 后面的规则跳过已处理过的 —— 兜底规则因此只处理前面都没命中的邮件。
+  const processed = new Set();
 
   for (let i = 0; i < CONFIG.rules.length; i++) {
     if (outOfTime()) {
@@ -582,7 +601,7 @@ function run() {
           rule.markRead ? 'UNREAD' : null,
           rule.archive ? 'INBOX' : null,
         ].filter(Boolean),
-      }, outOfTime);
+      }, outOfTime, processed);
 
       total += r.count;
       if (r.stopped) {
@@ -590,7 +609,7 @@ function run() {
         break;
       }
     } catch (e) {
-      // 一条规则挂了(比如查询语法写错)不能拖垮剩下 15 条
+      // 一条规则挂了(比如查询语法写错)不能拖垮剩下的规则
       console.log(`${tag}: 出错已跳过 — ${e.message}`);
     }
   }
